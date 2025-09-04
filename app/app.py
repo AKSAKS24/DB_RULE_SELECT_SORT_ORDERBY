@@ -3,26 +3,21 @@ from pydantic import BaseModel
 from typing import List, Optional
 import re, json
 
-app = FastAPI(title="ABAP Scanner - ORDER BY / SORT Rule (Final Table-Aware)")
+app = FastAPI(title="ABAP Scanner - ORDER BY / SORT Rule (Final Table-Aware + Select Single Support)")
 
-# Regex: capture SELECT statement until first period (.)
+# Regex: capture SELECT [SINGLE] ... FROM ... until first period (.)
 SQL_SELECT_BLOCK_RE = re.compile(
-    r"\bSELECT\b(?P<select>.+?)\bFROM\b\s+(?P<table>\w+)(?P<rest>.*?\.)",
+    r"\bSELECT\b(?P<single>\s+SINGLE)?(?P<select>.+?)\bFROM\b\s+(?P<table>\w+)(?P<rest>.*?\.)",
     re.IGNORECASE | re.DOTALL,
 )
 
 FOR_ALL_ENTRIES_RE = re.compile(r"\bFOR\s+ALL\s+ENTRIES\b", re.IGNORECASE)
 FIELDS_RE = re.compile(r"\b(\w+)\b", re.IGNORECASE)
-
-# Patterns for checks
 ORDERBY_RE = re.compile(r"ORDER\s+BY", re.IGNORECASE)
-# Detect INTO TABLE target (either @DATA(name) or plain name)
 INTO_TABLE_RE = re.compile(r"\bINTO\s+TABLE\s+(?:@DATA\((\w+)\)|(\w+))", re.IGNORECASE)
 
-# Sort detection regex builder
 def make_sort_re(table_name: str):
     return re.compile(rf"\bSORT\s+{re.escape(table_name)}\b.*?\bBY\b", re.IGNORECASE | re.DOTALL)
-
 
 class Unit(BaseModel):
     pgm_name: str
@@ -31,17 +26,20 @@ class Unit(BaseModel):
     name: Optional[str] = None
     code: Optional[str] = ""
 
-
 def scan_sql(code: str):
     results = []
 
     for stmt in SQL_SELECT_BLOCK_RE.finditer(code):
         stmt_text = stmt.group(0)   # full SELECT statement (ending at ".")
         span = stmt.span()
+        is_single = bool(stmt.group("single"))
         has_fae = FOR_ALL_ENTRIES_RE.search(stmt_text) is not None
 
-        # Extract selected fields (remove INTO ...)
+        # Extract selected fields and clean up 'SINGLE' if present
         select_fields_raw = stmt.group("select")
+        if is_single:
+            # Remove 'SINGLE' if present at the start
+            select_fields_raw = re.sub(r'^\s*SINGLE\s+', '', select_fields_raw, flags=re.IGNORECASE)
         select_fields_raw = re.sub(
             r"\bINTO\b.+", "", select_fields_raw, flags=re.IGNORECASE | re.DOTALL
         )
@@ -51,7 +49,9 @@ def scan_sql(code: str):
         if "*" in select_fields_raw:
             results.append({
                 "target_type": "SQL_SELECT",
-                "target_name": "FOR_ALL_ENTRIES" if has_fae else "NO_FOR_ALL_ENTRIES",
+                "target_name": (
+                    "SELECT_SINGLE" if is_single else "FOR_ALL_ENTRIES" if has_fae else "NO_FOR_ALL_ENTRIES"
+                ),
                 "span": span,
                 "used_fields": ["*"],
                 "suggested_statement": "Avoid SELECT * — not recommended. Please specify fields explicitly."
@@ -73,7 +73,12 @@ def scan_sql(code: str):
             target_table = m.group(1) or m.group(2)
 
         suggestion = None
-        if not has_fae:  # --- Normal SELECT must have ORDER BY
+
+        # Skip ORDER BY check for SELECT SINGLE
+        if is_single:
+            pass  # No order by or sort required for select single
+
+        elif not has_fae:  # --- Normal SELECT must have ORDER BY
             if not ORDERBY_RE.search(stmt_text.replace("\n", " ")):
                 suggestion = (
                     f"Add ORDER BY {', '.join(fields)} inside SELECT (all fields in select list)."
@@ -105,14 +110,15 @@ def scan_sql(code: str):
         if suggestion:
             results.append({
                 "target_type": "SQL_SELECT",
-                "target_name": "FOR_ALL_ENTRIES" if has_fae else "NO_FOR_ALL_ENTRIES",
+                "target_name": (
+                    "SELECT_SINGLE" if is_single else "FOR_ALL_ENTRIES" if has_fae else "NO_FOR_ALL_ENTRIES"
+                ),
                 "span": span,
                 "used_fields": fields,
                 "suggested_statement": suggestion,
             })
 
     return results
-
 
 @app.post("/assess-orderby-sort")
 def assess(units: List[Unit]):
@@ -141,7 +147,6 @@ def assess(units: List[Unit]):
         results.append(obj)
     return results
 
-
 @app.get("/health")
 def health():
-    return {"ok": True, "note": "ORDER_BY_SORT_RULE"}
+    return {"ok": True, "note": "ORDER_BY_SORT_RULE - with SELECT SINGLE support"}
