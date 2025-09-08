@@ -142,7 +142,7 @@ def scan_sql_block_style(code: str):
     return findings
 
 @app.post("/assess-orderby-sort")
-def assess(units: List[Unit]):
+async def assess(units: List[Unit]):
     results = []
     for u in units:
         code = u.code or ""
